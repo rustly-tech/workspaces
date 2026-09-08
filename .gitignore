@@ -1,0 +1,6 @@
+/target/
+.env
+repositories/
+*.log
+.DS_Store
+

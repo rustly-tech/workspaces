@@ -1,0 +1,15 @@
+[package]
+name = "rustly-git-auth"
+description = "Provider-neutral authentication and authorization for Rustly Git workspaces."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+blake3.workspace = true
+rustly-git-protocol.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

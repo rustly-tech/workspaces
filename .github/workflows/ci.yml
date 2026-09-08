@@ -1,0 +1,99 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  rust:
+    uses: rustly-tech/.github/.github/workflows/rust-ci.yml@main
+    with:
+      msrv: "1.88.0"
+      features: "--all-features"
+
+  security:
+    uses: rustly-tech/.github/.github/workflows/rust-security.yml@main
+
+  smart-http:
+    name: real Git Smart HTTP (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: smart-http-${{ matrix.os }}
+      - run: cargo test -p rustly-git-http --test smart_http -- --nocapture
+
+  container:
+    name: container image
+    needs: [rust, smart-http]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Build
+        run: docker build -t rustly-git:${{ github.sha }} .
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          docker run -d --name rustly-git -p 8090:8090 \
+            -e 'RUSTLY_GIT_CREDENTIALS={"ci":"ci-token-that-is-at-least-thirty-two-bytes"}' \
+            rustly-git:${{ github.sha }}
+          trap 'docker rm -f rustly-git >/dev/null 2>&1 || true' EXIT
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8090/healthz >/dev/null && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8090/healthz | grep -q '"status":"ok"'
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish immutable and channel tags
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          IMAGE=ghcr.io/${{ github.repository }}/http
+          docker tag rustly-git:${{ github.sha }} "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:${{ github.sha }}"
+          if [ "${{ github.ref }}" = refs/heads/main ]; then
+            docker tag rustly-git:${{ github.sha }} "$IMAGE:main"
+            docker push "$IMAGE:main"
+          fi
+          case "${{ github.ref }}" in
+            refs/tags/v*)
+              docker tag rustly-git:${{ github.sha }} "$IMAGE:${GITHUB_REF_NAME}"
+              docker push "$IMAGE:${GITHUB_REF_NAME}"
+              ;;
+          esac
+      - name: Generate SBOM
+        if: github.event_name == 'push'
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: rustly-git:${{ github.sha }}
+          artifact-name: rustly-git-sbom.spdx.json
+

@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = ["crates/protocol", "crates/auth", "services/http"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rustly-tech/git"
+authors = ["Rustly contributors"]
+
+[workspace.dependencies]
+rustly-git-auth = { path = "crates/auth", version = "0.1.0" }
+rustly-git-protocol = { path = "crates/protocol", version = "0.1.0" }
+
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["json"] }
+blake3 = "1.8"
+http = "1"
+http-body-util = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "net", "signal", "fs", "time"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["limit", "request-id", "trace", "util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
