@@ -1,6 +1,6 @@
 [package]
 name = "rustly-git-http"
-description = "Authenticated Git Smart HTTP ingress for Rustly workspaces."
+description = "Git-backed coding workspaces for Rustly."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
