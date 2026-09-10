@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 axum.workspace = true
 http.workspace = true
 rustly-git-auth.workspace = true

@@ -2,6 +2,7 @@
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
+use async_trait::async_trait;
 use axum::{
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, Path, Query, State},
@@ -11,7 +12,7 @@ use axum::{
     Json, Router,
 };
 use rustly_git_auth::{AuthError, DynAuthenticator, Principal};
-use rustly_git_protocol::{GitService, Slug};
+use rustly_git_protocol::{GitService, RepositoryId, Slug};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{io::AsyncWriteExt, process::Command};
@@ -22,23 +23,70 @@ const MAX_PUSH_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
-    root: Arc<PathBuf>,
     auth: DynAuthenticator,
-    git_binary: Arc<PathBuf>,
+    repositories: Arc<dyn RepositoryProvider>,
 }
 
 impl AppState {
     pub fn new(root: PathBuf, auth: DynAuthenticator) -> Self {
         Self {
-            root: Arc::new(root),
             auth,
-            git_binary: Arc::new(PathBuf::from("git")),
+            repositories: Arc::new(LocalGitProvider::new(root)),
         }
     }
 
-    pub fn with_git_binary(mut self, binary: PathBuf) -> Self {
-        self.git_binary = Arc::new(binary);
-        self
+    /// Construct with another repository provider.
+    ///
+    /// A future external provider is injected here and receives only stable
+    /// Rustly repository identities and scoped requests. Rustly authentication
+    /// remains outside the provider.
+    pub fn with_provider(auth: DynAuthenticator, provider: Arc<dyn RepositoryProvider>) -> Self {
+        Self {
+            auth,
+            repositories: provider,
+        }
+    }
+}
+
+/// Request passed from the authenticated Rustly boundary to a repository
+/// provider.
+pub struct RepositoryRequest {
+    pub suffix: String,
+    pub service: GitService,
+    pub method: String,
+    pub query: String,
+    pub content_type: String,
+    pub git_protocol: Option<String>,
+    pub remote_account: String,
+    pub body: Bytes,
+}
+
+/// Repository operations needed by Rustly workspaces.
+///
+/// Implementations may use local Git storage or a future remote API. They do
+/// not authenticate Rustly users and never receive a Rustly access token.
+#[async_trait]
+pub trait RepositoryProvider: Send + Sync {
+    async fn create(&self, id: &RepositoryId) -> Result<bool, ApiError>;
+    async fn execute(
+        &self,
+        id: &RepositoryId,
+        request: RepositoryRequest,
+    ) -> Result<Bytes, ApiError>;
+}
+
+/// Current local, Git-backed repository provider.
+pub struct LocalGitProvider {
+    root: PathBuf,
+    git_binary: PathBuf,
+}
+
+impl LocalGitProvider {
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            git_binary: PathBuf::from("git"),
+        }
     }
 }
 
@@ -75,34 +123,16 @@ async fn create_workspace(
     let owner: Slug = owner.parse()?;
     let workspace: Slug = workspace.parse()?;
     authorize(&state, &headers, &owner)?;
-
-    let owner_root = state.root.join(owner.as_str());
-    let repository = owner_root.join(format!("{workspace}.git"));
-    tokio::fs::create_dir_all(&owner_root).await?;
-
-    if repository.exists() {
-        return Ok((
-            StatusCode::OK,
-            Json(WorkspaceResponse::new(&owner, &workspace, false)),
-        ));
-    }
-
-    let output = Command::new(state.git_binary.as_ref())
-        .args(["init", "--bare", "--initial-branch=main"])
-        .arg(&repository)
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .output()
-        .await?;
-    if !output.status.success() {
-        return Err(ApiError::Git(
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        ));
-    }
+    let id = RepositoryId::new(owner.clone(), workspace.clone());
+    let created = state.repositories.create(&id).await?;
 
     Ok((
-        StatusCode::CREATED,
-        Json(WorkspaceResponse::new(&owner, &workspace, true)),
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(WorkspaceResponse::new(&owner, &workspace, created)),
     ))
 }
 
@@ -184,13 +214,6 @@ async fn dispatch(
     let owner: Slug = owner.parse()?;
     let workspace: Slug = workspace.parse()?;
     let principal = authorize(&state, request.headers(), &owner)?;
-    let repository = state
-        .root
-        .join(owner.as_str())
-        .join(format!("{workspace}.git"));
-    if !repository.is_dir() {
-        return Err(ApiError::NotFound);
-    }
 
     if request.method() == http::Method::POST {
         let expected = format!("application/x-{}-request", service.command());
@@ -220,51 +243,112 @@ async fn dispatch(
         .to_owned();
     let body = axum::body::to_bytes(request.into_body(), MAX_PUSH_BYTES).await?;
 
-    let mut command = Command::new(state.git_binary.as_ref());
-    command
-        .arg("http-backend")
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_HTTP_EXPORT_ALL", "1")
-        .env("GIT_PROJECT_ROOT", state.root.join(owner.as_str()))
-        .env("PATH_INFO", format!("/{workspace}.git/{suffix}"))
-        .env("REQUEST_METHOD", method)
-        .env("QUERY_STRING", query)
-        .env("CONTENT_TYPE", content_type)
-        .env("CONTENT_LENGTH", body.len().to_string())
-        .env("REMOTE_USER", principal.account.as_str())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    if let Some(protocol) = git_protocol {
-        command.env("HTTP_GIT_PROTOCOL", protocol);
-    }
-
-    let mut child = command.spawn()?;
-    child
-        .stdin
-        .take()
-        .ok_or(ApiError::MissingPipe)?
-        .write_all(&body)
+    let id = RepositoryId::new(owner, workspace);
+    let output = state
+        .repositories
+        .execute(
+            &id,
+            RepositoryRequest {
+                suffix: suffix.to_owned(),
+                service,
+                method,
+                query,
+                content_type,
+                git_protocol,
+                remote_account: principal.account.to_string(),
+                body,
+            },
+        )
         .await?;
-    let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
-        .await
-        .map_err(|_| ApiError::GitTimeout)??;
-    if !output.status.success() {
-        tracing::warn!(
-            owner = %owner,
-            workspace = %workspace,
-            service = service.command(),
-            stderr = %String::from_utf8_lossy(&output.stderr),
-            "git http-backend failed"
-        );
-        return Err(ApiError::Git("git backend rejected the request".to_owned()));
+    parse_cgi_response(output)
+}
+
+#[async_trait]
+impl RepositoryProvider for LocalGitProvider {
+    async fn create(&self, id: &RepositoryId) -> Result<bool, ApiError> {
+        let owner_root = self.root.join(id.owner().as_str());
+        let repository = owner_root.join(format!("{}.git", id.name()));
+        tokio::fs::create_dir_all(&owner_root).await?;
+        if repository.exists() {
+            return Ok(false);
+        }
+
+        let output = Command::new(&self.git_binary)
+            .args(["init", "--bare", "--initial-branch=main"])
+            .arg(&repository)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Err(ApiError::Git(
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ));
+        }
+        Ok(true)
     }
 
-    parse_cgi_response(Bytes::from(output.stdout))
+    async fn execute(
+        &self,
+        id: &RepositoryId,
+        request: RepositoryRequest,
+    ) -> Result<Bytes, ApiError> {
+        let repository = self
+            .root
+            .join(id.owner().as_str())
+            .join(format!("{}.git", id.name()));
+        if !repository.is_dir() {
+            return Err(ApiError::NotFound);
+        }
+
+        let mut command = Command::new(&self.git_binary);
+        command
+            .arg("http-backend")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_HTTP_EXPORT_ALL", "1")
+            .env("GIT_PROJECT_ROOT", self.root.join(id.owner().as_str()))
+            .env(
+                "PATH_INFO",
+                format!("/{}.git/{}", id.name(), request.suffix),
+            )
+            .env("REQUEST_METHOD", request.method)
+            .env("QUERY_STRING", request.query)
+            .env("CONTENT_TYPE", request.content_type)
+            .env("CONTENT_LENGTH", request.body.len().to_string())
+            .env("REMOTE_USER", request.remote_account)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        if let Some(protocol) = request.git_protocol {
+            command.env("HTTP_GIT_PROTOCOL", protocol);
+        }
+
+        let mut child = command.spawn()?;
+        child
+            .stdin
+            .take()
+            .ok_or(ApiError::MissingPipe)?
+            .write_all(&request.body)
+            .await?;
+        let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+            .await
+            .map_err(|_| ApiError::GitTimeout)??;
+        if !output.status.success() {
+            tracing::warn!(
+                owner = %id.owner(),
+                workspace = %id.name(),
+                service = request.service.command(),
+                stderr = %String::from_utf8_lossy(&output.stderr),
+                "git http-backend failed"
+            );
+            return Err(ApiError::Git("git backend rejected the request".to_owned()));
+        }
+        Ok(Bytes::from(output.stdout))
+    }
 }
 
 fn authorize(state: &AppState, headers: &HeaderMap, owner: &Slug) -> Result<Principal, ApiError> {

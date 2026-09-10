@@ -1,11 +1,16 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
+use async_trait::async_trait;
 use axum::{
     body::{to_bytes, Body},
     http::{header, Request, StatusCode},
 };
 use rustly_git_auth::StaticTokens;
-use rustly_git_http::{app, AppState};
+use rustly_git_http::{app, ApiError, AppState, RepositoryProvider, RepositoryRequest};
+use rustly_git_protocol::RepositoryId;
 use tempfile::TempDir;
 use tokio::process::Command;
 use tower::ServiceExt as _;
@@ -28,6 +33,43 @@ fn request(method: &str, uri: &str, token: Option<&str>) -> Request<Body> {
         builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
     }
     builder.body(Body::empty()).unwrap()
+}
+
+struct RecordingProvider(Mutex<Option<RepositoryId>>);
+
+#[async_trait]
+impl RepositoryProvider for RecordingProvider {
+    async fn create(&self, id: &RepositoryId) -> Result<bool, ApiError> {
+        *self.0.lock().unwrap() = Some(id.clone());
+        Ok(true)
+    }
+
+    async fn execute(
+        &self,
+        _id: &RepositoryId,
+        _request: RepositoryRequest,
+    ) -> Result<axum::body::Bytes, ApiError> {
+        unreachable!()
+    }
+}
+
+#[tokio::test]
+async fn repository_providers_receive_a_stable_identity_after_rustly_auth() {
+    let auth = StaticTokens::new([("alice".parse().unwrap(), ALICE_TOKEN.to_owned())]).unwrap();
+    let provider = Arc::new(RecordingProvider(Mutex::new(None)));
+    let router = app(AppState::with_provider(Arc::new(auth), provider.clone()));
+    let response = router
+        .oneshot(request(
+            "POST",
+            "/v1/workspaces/alice/ownership",
+            Some(ALICE_TOKEN),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let id = provider.0.lock().unwrap().clone().unwrap();
+    assert_eq!(id.owner().as_str(), "alice");
+    assert_eq!(id.name().as_str(), "ownership");
 }
 
 #[tokio::test]

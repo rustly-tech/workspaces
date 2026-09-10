@@ -6,6 +6,8 @@ The service creates a learner's repository and lets standard Git clients clone,
 fetch, and push it over HTTP. It currently supports local development and
 trusted self-hosting. Authentication, quotas, and storage still need further
 work before an Internet-facing deployment; see the [threat model](docs/THREAT_MODEL.md).
+The [repository provider boundary](docs/REPOSITORY_PROVIDER.md) keeps workspace
+identity independent of its current local Git storage.
 
 ## Run locally
 

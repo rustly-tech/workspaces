@@ -61,6 +61,31 @@ impl FromStr for Slug {
     }
 }
 
+/// Rustly's stable identity for a coding repository.
+///
+/// Storage paths and clone URLs are derived from this value by a repository
+/// provider. They are locations, not identities, and may change when a learner
+/// links or unlinks an external provider.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RepositoryId {
+    owner: Slug,
+    name: Slug,
+}
+
+impl RepositoryId {
+    pub fn new(owner: Slug, name: Slug) -> Self {
+        Self { owner, name }
+    }
+
+    pub fn owner(&self) -> &Slug {
+        &self.owner
+    }
+
+    pub fn name(&self) -> &Slug {
+        &self.name
+    }
+}
+
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 #[error("must be 1-63 lowercase ASCII letters, digits, or interior hyphens")]
 pub struct InvalidSlug;
@@ -126,5 +151,13 @@ mod tests {
         );
         assert!(GitService::parse("upload-archive").is_err());
         assert!(GitService::parse("sh -c anything").is_err());
+    }
+
+    #[test]
+    fn repository_identity_contains_no_location() {
+        let id = RepositoryId::new("learner".parse().unwrap(), "ownership".parse().unwrap());
+        let encoded = serde_json::to_string(&id).unwrap();
+        assert_eq!(encoded, r#"{"owner":"learner","name":"ownership"}"#);
+        assert!(!encoded.contains('/') && !encoded.contains("http"));
     }
 }
